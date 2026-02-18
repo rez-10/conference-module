@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Minimal 1-to-1 WebRTC</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        background: #111827;
+        color: #e5e7eb;
+      }
+
+      main {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 1rem;
+      }
+
+      .card {
+        background: #1f2937;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+      }
+
+      .controls {
+        display: grid;
+        gap: 0.75rem;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      }
+
+      label {
+        display: grid;
+        gap: 0.35rem;
+      }
+
+      input,
+      button {
+        border: 1px solid #374151;
+        background: #111827;
+        color: #fff;
+        border-radius: 8px;
+        padding: 0.6rem;
+      }
+
+      button {
+        cursor: pointer;
+        background: #2563eb;
+        border: none;
+      }
+
+      .videos {
+        display: grid;
+        gap: 1rem;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      }
+
+      video {
+        width: 100%;
+        border-radius: 8px;
+        background: #000;
+      }
+
+      pre {
+        white-space: pre-wrap;
+        max-height: 250px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>WebRTC Baseline</h1>
+
+      <section class="card controls">
+        <label>
+          Signaling URL
+          <input id="signalingUrl" placeholder="wss://your-domain/ws" />
+        </label>
+
+        <label>
+          Room ID
+          <input id="roomId" value="room-123" />
+        </label>
+
+        <div style="display: flex; align-items: end">
+          <button id="startBtn" type="button">Start call</button>
+        </div>
+      </section>
+
+      <section class="card videos">
+        <div>
+          <h2>Local</h2>
+          <video id="localVideo" autoplay muted playsinline></video>
+        </div>
+
+        <div>
+          <h2>Remote</h2>
+          <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Logs</h2>
+        <pre id="logs"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="./transport.js"></script>
+  </body>
+</html>

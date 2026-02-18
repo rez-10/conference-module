@@ -1,0 +1,466 @@
+DOC 9 — WebRTC Implementation Details and Transport Layer
+Real-Time Conference System
+--------------------------------------------------
+
+1. Purpose
+
+This document specifies the concrete WebRTC implementation details that 
+realize the media transport described abstractly in prior documents.
+
+This exists because:
+- WebRTC has sharp edges
+- Browser quirks are real
+- NAT traversal fails in production
+- Signaling races cause subtle bugs
+
+If you haven't shipped WebRTC, you'll underestimate these.
+
+--------------------------------------------------
+
+2. ICE and NAT Traversal
+
+2.1 ICE Candidate Gathering Strategy
+
+Strategy: FULL (gather all candidate types)
+
+Candidate preference order:
+1. host candidates (local IP)
+2. srflx candidates (STUN-discovered public IP)
+3. relay candidates (TURN relay)
+
+Rationale:
+- Start with cheapest path (direct)
+- Fall back to relay for symmetric NAT
+- TURN is expensive (bandwidth cost) so use last
+
+--------------------------------------------------  
+
+2.2 STUN/TURN Server Configuration
+
+STUN servers: (free, Google-operated)
+- stun:stun.l.google.com:19302
+- stun:stun1.l.google.com:19302
+
+TURN servers: (V1 self-hosted, coturn)
+- turn:turn.example.com:3478?transport=udp
+- turn:turn.example.com:3478?transport=tcp
+- turns:turn.example.com:5349?transport=tcp (TLS)
+
+Credentials: time-limited (HMAC-based)
+- Username: timestamp:participant_id
+- Credential: HMAC-SHA1(secret, username)
+- Validity: 24 hours
+
+Rationale for self-hosted TURN:
+- Third-party TURN is expensive ($0.10/GB)
+- Expected usage: 10-20% of connections need relay
+- V1 budget: 1 TURN server handles 50 concurrent users
+
+--------------------------------------------------
+
+2.3 ICE Failure Modes
+
+Failure: No STUN response
+- Symptom: only host candidates gathered
+- Impact: connection fails if behind NAT
+- Mitigation: TURN fallback
+
+Failure: TURN server unavailable
+- Symptom: symmetric NAT users can't connect
+- Impact: ~10% of users fail to join
+- Mitigation: surface error, require user to retry
+- V1 acceptance: manual intervention acceptable
+
+Failure: ICE timeout (30s default)
+- Symptom: candidates gathered but no connectivity
+- Impact: participant stuck in "connecting" state
+- Resolution: fail-closed, require rejoin
+- Monitoring: track ICE failures per session
+
+--------------------------------------------------
+
+3. SDP Offer/Answer Flow
+
+3.1 Canonical SDP Exchange Sequence
+
+Phase 1: Offer Generation (Client)
+1. Client creates RTCPeerConnection
+2. Client adds local tracks (audio/video)
+3. Client calls createOffer()
+4. Client sets local SDP via setLocalDescription()
+5. Client sends offer to Gateway via WebSocket
+
+Phase 2: Answer Generation (SFU via Gateway)
+6. Gateway validates participant token
+7. Gateway forwards offer to SFU
+8. SFU creates answer SDP
+9. SFU returns answer to Gateway
+10. Gateway sends answer to Client
+
+Phase 3: Answer Application (Client)
+11. Client receives answer
+12. Client calls setRemoteDescription()
+13. ICE connectivity checks begin
+14. Media flows once ICE succeeds
+
+--------------------------------------------------
+
+3.2 SDP Offer Example (Illustrative)
+
+v=0
+o=- 4611731400430051336 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=group:BUNDLE 0 1
+a=msid-semantic: WMS stream_id
+
+m=audio 9 UDP/TLS/RTP/SAVPF 111 103
+c=IN IP4 0.0.0.0
+a=rtcp:9 IN IP4 0.0.0.0
+a=ice-ufrag:xyz
+a=ice-pwd:abc
+a=fingerprint:sha-256 XX:YY:ZZ...
+a=setup:actpass
+a=mid:0
+a=sendrecv
+a=rtcp-mux
+a=rtpmap:111 opus/48000/2
+a=msid:stream_id audio_track_id
+
+m=video 9 UDP/TLS/RTP/SAVPF 96
+... (similar structure for video)
+
+--------------------------------------------------
+
+3.3 SDP Failure Modes
+
+Failure: Codec mismatch
+- Cause: Client offers VP8, SFU only supports H264
+- Detection: No common codecs in answer
+- Resolution: Client displays "browser unsupported"
+- V1: Support VP8, VP9, H264 (covers 99% browsers)
+
+Failure: SDP format invalid
+- Cause: Browser bug or corrupted message
+- Detection: setRemoteDescription() throws
+- Resolution: Fail-closed, surface error
+- V1: No auto-retry (user must rejoin)
+
+Failure: DTLS handshake failure
+- Cause: Fingerprint mismatch or cert issue
+- Symptom: ICE succeeds but no RTP flows
+- Resolution: Disconnect after 10s timeout
+- Monitoring: Track DTLS failures separately
+
+--------------------------------------------------
+
+4. Trickle ICE Implementation
+
+4.1 Rationale
+
+Standard ICE: Wait for all candidates before signaling
+Trickle ICE: Send candidates as discovered
+
+Benefit: Reduces connection time by ~2-3 seconds
+Trade-off: More complex signaling (more messages)
+
+V1 Decision: Implement trickle ICE
+- 2s faster connection worth the complexity
+- Standard in all browsers since 2018
+
+--------------------------------------------------
+
+4.2 Trickle ICE Message Flow
+
+After SDP exchange completes:
+
+Client discovers candidate:
+→ WS message: { type: "ice-candidate", candidate: {...} }
+
+Gateway validates:
+→ Forwards to SFU
+
+SFU discovers candidate:
+→ Gateway receives candidate
+→ WS message to Client: { type: "ice-candidate", candidate: {...} }
+
+Client adds candidate:
+→ Calls addIceCandidate()
+
+End-of-candidates signal:
+→ WS message: { type: "ice-candidate", candidate: null }
+
+--------------------------------------------------
+
+4.3 Trickle ICE Edge Cases
+
+Race condition: Candidate arrives before answer
+- Client behavior: Queue candidate
+- Apply queue after setRemoteDescription()
+- Standard browser behavior, no special handling
+
+Candidate after connection established:
+- Ignore (connection already stable)
+- Log for diagnostics
+
+Malformed candidate:
+- addIceCandidate() rejects
+- Log error, continue (connection may still succeed via other candidates)
+
+--------------------------------------------------
+
+5. Connection State Management
+
+5.1 ICE Connection States (RTCPeerConnection.iceConnectionState)
+
+"new" → gathering candidates
+"checking" → connectivity checks in progress
+"connected" → at least one candidate pair working
+"completed" → all checks done
+"failed" → all candidates tried, none worked
+"disconnected" → connection lost (may recover)
+"closed" → connection terminated
+
+--------------------------------------------------
+
+5.2 State Transition Handling
+
+State: "failed"
+→ Action: Disconnect participant
+→ Client UI: "Connection failed. Please rejoin."
+→ No auto-retry (V1 fail-closed)
+
+State: "disconnected"
+→ Action: Start 10s reconnect timer
+→ If recovers → continue
+→ If timeout → treat as "failed"
+→ Rationale: Brief network blips are recoverable
+
+State: "connected" → "disconnected" → "connected"
+→ Action: Log recovery, continue session
+→ No re-admission needed (transport-level issue)
+
+--------------------------------------------------
+
+6. Media Track Management
+
+6.1 Track Constraints
+
+Audio:
+- Codec: Opus (48kHz, stereo)
+- Bitrate: 32-128 kbps adaptive
+- DTX: enabled (discontinuous transmission for silence)
+- FEC: enabled (forward error correction)
+
+Video:
+- Codec: VP8 (primary), H264 (fallback)
+- Resolution: 640x480 (V1 fixed, no simulcast)
+- Bitrate: 500 kbps target
+- Framerate: 30fps max
+
+--------------------------------------------------
+
+6.2 Track Replacement (Mute/Unmute)
+
+V1 Implementation: Track replacement (NOT sender.replaceTrack)
+
+Mute:
+1. Stop local MediaStreamTrack
+2. Remove from RTCPeerConnection
+3. Renegotiation NOT required (track removed)
+4. SFU stops forwarding (no packets received)
+
+Unmute:
+1. Acquire new MediaStreamTrack
+2. Add to RTCPeerConnection via addTrack()
+3. Renegotiation required (SDP exchange)
+4. Authority check: verify "can_send_audio" permission still held
+5. If revoked: block addTrack(), surface error
+
+Rationale: Simple, explicit, easier to debug than sender.replaceTrack()
+
+--------------------------------------------------
+
+7. SFU-Specific Details
+
+7.1 SFU Implementation Choice
+
+Selected: mediasoup v3 (Node.js)
+
+Alternatives considered:
+- Janus (C): Lower latency, harder to extend
+- Jitsi Videobridge (Java): Heavier, more features than needed
+- Custom: Ruled out (too much work for V1)
+
+Rationale for mediasoup:
+- Node.js (matches Application Layer stack)
+- Excellent TypeScript support
+- Production-ready (used by Whereby, Miro)
+- Active maintenance (latest release 2 weeks ago)
+
+--------------------------------------------------
+
+7.2 SFU Permission Enforcement Point
+
+Architecture:
+- mediasoup Router (per session)
+- Producer (per participant sending track)
+- Consumer (per participant receiving track)
+
+Enforcement logic:
+
+On Producer creation (participant wants to send):
+1. SFU reads permission from Redis
+   Key: sess:{session_id}:participants
+   Field: {participant_id}
+   Value: JSON with "can_send_audio", "can_send_video"
+
+2. Check permission:
+   if (!permissions.can_send_audio && trackKind === 'audio'):
+     reject Producer creation
+     disconnect participant
+
+3. If permission check fails (Redis error):
+   fail-closed: reject Producer, disconnect
+
+On Consumer creation (participant wants to receive):
+1. Check "can_receive_media" permission
+2. If revoked: do not create Consumer
+3. Existing Consumers remain active until next refresh
+
+Refresh interval: 5 seconds
+- Every 5s, SFU re-fetches permissions for all active participants
+- If permission revoked: close Producer/Consumer
+- If fetch fails: disconnect participant after 3 consecutive failures
+
+--------------------------------------------------
+
+7.3 SFU Resource Limits (V1)
+
+Single mediasoup worker limits:
+- Max producers: 100 (CPU-bound)
+- Max consumers: 500 (routing complexity)
+
+V1 session limits (derived):
+- Max participants: 10
+- Max video senders: 10
+- Max consumers per session: 10 senders × 9 receivers = 90
+
+Why 10 participants:
+- Conservative for V1
+- Covers 95% of use cases (team meetings)
+- Leaves CPU headroom for debugging
+
+--------------------------------------------------
+
+8. Browser-Specific Quirks
+
+8.1 Chrome/Edge (Blink)
+
+Issue: Aggressive ICE timeout (5s)
+Mitigation: STUN server must respond quickly
+
+Issue: Hardware encoder preference
+Impact: H264 may be chosen over VP8
+Action: Accept (H264 widely supported)
+
+--------------------------------------------------
+
+8.2 Firefox
+
+Issue: Older versions don't support Unified Plan
+Mitigation: V1 targets Firefox 90+ (Dec 2021)
+
+Issue: Different DTLS fingerprint format
+Action: SFU must normalize fingerprints
+
+--------------------------------------------------
+
+8.3 Safari
+
+Issue: VP9 not supported (as of Safari 17)
+Mitigation: Offer VP8 and H264 in SDP
+
+Issue: Requires user gesture for getUserMedia
+Action: Client must prompt before join
+
+Issue: Simulcast not supported
+Action: V1 doesn't use simulcast anyway
+
+--------------------------------------------------
+
+9. Monitoring and Diagnostics
+
+9.1 Critical Metrics to Track
+
+ICE failures:
+- Metric: ice_failure_total (counter)
+- Labels: reason (stun_timeout, turn_unavailable)
+
+DTLS failures:
+- Metric: dtls_handshake_failure_total
+- Labels: participant_id, session_id
+
+Connection time:
+- Metric: ice_connection_duration_seconds (histogram)
+- Buckets: 1s, 2s, 5s, 10s, 30s
+
+SFU permission refresh failures:
+- Metric: permission_refresh_failure_total
+- Labels: session_id, reason
+
+--------------------------------------------------
+
+9.2 Client-Side Diagnostics
+
+Expose to UI:
+- ICE connection state (for debugging)
+- Selected candidate pair (relay vs direct)
+- Round-trip time (from RTCStatsReport)
+- Packet loss percentage
+
+V1: Simple debug panel (hidden by default)
+- Shows connection info when user clicks "?"
+- Helps support team diagnose issues
+
+--------------------------------------------------
+
+10. Known Limitations and Accepted Trade-offs
+
+Limitation: No connection quality auto-adjustment
+- Impact: Video may stutter on poor connections
+- V1 acceptance: Fixed bitrate acceptable
+- V2 consideration: Adaptive bitrate
+
+Limitation: No reconnect with media continuity
+- Impact: Reconnect requires renegotiation
+- V1 acceptance: Brief interruption acceptable
+- Alternative rejected: Faster but more complex
+
+Limitation: Single SFU (no routing)
+- Impact: All participants must reach same SFU
+- V1 acceptance: Regional deployment only
+- V2 consideration: Multi-SFU mesh
+
+--------------------------------------------------
+
+11. Security Considerations
+
+DTLS-SRTP:
+- All media encrypted end-to-SFU (not E2E)
+- SFU can inspect packets (required for routing)
+- V1 acceptance: E2E encryption deferred
+
+TURN credential security:
+- Time-limited HMAC credentials
+- Secret rotation: manual (every 90 days)
+- V1 acceptance: Manual rotation acceptable
+
+SDP validation:
+- Gateway validates SDP format before forwarding
+- Prevents malformed SDP from crashing SFU
+- Rejects SDP with unexpected codecs
+
+--------------------------------------------------
+
+End of DOC 9

@@ -1,0 +1,373 @@
+DOC 10 — Redis Schema, Operations, and Failure Handling
+Real-Time Conference System
+
+Status: Normative  
+Audience: Backend engineers, SRE, reviewers
+Depends on: DOC 2 (State Taxonomy), DOC 7 (Infra Model)
+
+--------------------------------------------------
+
+1. Purpose
+
+This document specifies:
+- Exact Redis key patterns
+- Data structures used
+- TTL strategies
+- Failover behavior
+- Operational runbooks
+
+If Redis goes down, we need deterministic behavior.
+This document defines that behavior.
+
+--------------------------------------------------
+
+2. Redis Deployment Architecture (V1)
+
+Instance: Single Redis 7.0 server
+Mode: Standalone (no cluster, no sentinel)
+Persistence: RDB snapshots every 5 minutes
+Memory: 4GB allocated
+Eviction policy: noeviction (fail writes if full)
+
+Rationale:
+- V1 doesn't need HA (manual restart acceptable)
+- Sentinel adds complexity without benefit at this scale
+- RDB sufficient (5min data loss acceptable on crash)
+
+V2 consideration: Redis Cluster for multi-region
+
+--------------------------------------------------
+
+3. Namespace Design
+
+All keys use prefixed namespaces to prevent collisions:
+
+Authority namespace: auth:*
+Runtime namespace: rt:*
+Transport namespace: sig:*
+
+Separation enforced:
+- Different code modules
+- Different Redis databases? NO (single DB, prefix-based)
+- Tests assert no cross-namespace writes
+
+--------------------------------------------------
+
+4. Authority State Schema
+
+4.1 Session Metadata
+
+Key pattern: auth:sess:{session_id}:meta
+Type: Hash
+TTL: None (persists until explicit delete)
+
+Fields:
+  created_at → Unix timestamp (integer)
+  created_by → user_id (string)
+  status → "active" | "terminated" (string)
+  max_participants → integer (default 10)
+
+Example:
+  HSET auth:sess:sess_abc123:meta created_at 1710000000
+  HSET auth:sess:sess_abc123:meta created_by user_xyz
+  HSET auth:sess:sess_abc123:meta status active
+
+--------------------------------------------------
+
+4.2 Participant Authority
+
+Key pattern: auth:sess:{session_id}:participants
+Type: Hash
+TTL: None
+
+Fields (one per participant):
+  {participant_id} → JSON object
+
+JSON structure:
+{
+  "user_id": "user_xyz",
+  "role": "participant" | "moderator",
+  "permissions": {
+    "can_send_audio": true,
+    "can_send_video": true,
+    "can_receive_media": true,
+    "can_send_chat": true
+  },
+  "admitted_at": 1710000100,
+  "token_issued_at": 1710000105
+}
+
+Example:
+  HSET auth:sess:sess_abc:participants part_123 '{"user_id":"user_xyz",...}'
+
+Read pattern:
+  participant_data = HGET auth:sess:{session_id}:participants {participant_id}
+  permissions = JSON.parse(participant_data).permissions
+
+--------------------------------------------------
+
+4.3 Authority Write Strategy (retry-until-visible)
+
+Write sequence:
+1. Write to Redis via HSET
+2. Immediately read back via HGET
+3. If read succeeds and matches → success
+4. If read fails → retry after 100ms
+5. Max retries: 5 attempts (500ms total)
+6. If all retries fail → surface error to caller
+
+Code sketch:
+async function writeAuthority(key, field, value)
+{
+    for (let attempt = 0; attempt < 5; attempt++) {
+    await redis.hset(key, field, value);
+    const readback = await redis.hget(key, field);
+    if (readback === value) return { success: true };
+    await sleep(100);
+}
+    throw new Error('Authority write failed: not visible after retries');
+}
+
+Rationale:
+- Handles transient Redis issues
+- Bounded retry (no infinite loops)
+- Explicit failure surfaced (no silent data loss)
+
+--------------------------------------------------
+
+5. Runtime State Schema
+
+5.1 Participant Presence
+
+Key pattern: rt:presence:{session_id}:{participant_id}
+Type: String
+TTL: 45 seconds
+Value: JSON with connection metadata
+
+Value structure:
+{
+  "connection_id": "conn_xyz",
+  "gateway_instance": "gw-01",
+  "connected_at": 1710000200,
+  "last_heartbeat": 1710000230
+}
+
+Refresh pattern (Gateway writes every 30s):
+  SETEX rt:presence:{session_id}:{participant_id} 45 '{...}'
+
+Expiration behavior:
+- If heartbeat stops, key expires after 45s
+- Other components detect absence by missing key
+- No zombie presence records
+
+--------------------------------------------------
+
+5.2 Active Media Tracks
+
+Key pattern: rt:tracks:{session_id}:{participant_id}
+Type: Set
+TTL: None (managed by SFU)
+Members: Track IDs
+
+Example:
+  SADD rt:tracks:sess_abc:part_123 "audio_track_1"
+  SADD rt:tracks:sess_abc:part_123 "video_track_1"
+
+On participant disconnect:
+  DEL rt:tracks:sess_abc:part_123
+
+Usage:
+- SFU uses to track active producers
+- Clients can query to see who's sending media
+- Not authoritative (can be stale)
+
+--------------------------------------------------
+
+6. Transport State Schema (Ephemeral)
+
+6.1 Signaling State
+
+Key pattern: sig:conn:{connection_id}
+Type: Hash
+TTL: 300 seconds (5 minutes)
+
+Fields:
+  participant_id → string
+  session_id → string
+  sdp_offer → string (full SDP)
+  sdp_answer → string (full SDP)
+  ice_candidates → JSON array
+  state → "negotiating" | "connected" | "closed"
+
+Usage:
+- Gateway stores during SDP exchange
+- Short TTL (negotiation should complete in <10s)
+- Automatically cleaned up
+
+--------------------------------------------------
+
+7. Key Expiration Strategy
+
+| Namespace | TTL Policy | Rationale |
+|-----------|------------|-----------|
+| auth:* | No TTL | Authority persists until explicit delete |
+| rt:presence:* | 45s | Heartbeat-based liveness |
+| rt:tracks:* | No TTL | Managed by SFU lifecycle |
+| sig:* | 300s | Prevent leak from abandoned connections |
+
+--------------------------------------------------
+
+8. Redis Failure Modes and Behavior
+
+8.1 Redis Unavailable (Connection Lost)
+
+Impact by component:
+
+Session Manager (authority writes fail):
+- Cannot admit new participants
+- Cannot revoke permissions
+- Existing sessions continue (cached in SFU)
+- Action: Surface error to clients (503 Service Unavailable)
+
+Gateway (presence writes fail):
+- New connections fail (can't write presence)
+- Existing connections continue (no heartbeat needed for active media)
+- Action: Reject new signaling attempts
+
+SFU (permission reads fail):
+- Cannot create new Producers/Consumers
+- Existing media continues (permissions cached)
+- After 3 consecutive refresh failures → disconnect participant
+- Action: Fail-closed
+
+--------------------------------------------------
+
+8.2 Redis Restart (Data Loss)
+
+Scenario: Redis crashes, RDB restore loses last 5 minutes
+
+Authority state (sessions created in last 5min):
+- Lost
+- Participants disconnected by SFU (permission fetch fails)
+- Recovery: Users must rejoin
+
+Runtime state (presence):
+- Lost
+- Rebuilds automatically (heartbeats resume)
+- No user impact
+
+Transport state (signaling):
+- Lost
+- Active connections unaffected (signaling complete)
+- Abandoned keys cleaned by TTL
+
+V1 acceptance: 5min data loss acceptable (rare event)
+
+--------------------------------------------------
+
+8.3 Redis Memory Full
+
+Eviction policy: noeviction
+
+Behavior:
+- Writes fail with error: OOM command not allowed
+- Reads continue to work
+
+Impact:
+- Cannot admit new participants (authority write fails)
+- Cannot update permissions
+- Existing sessions continue
+
+Action:
+- Alert ops team
+- Manual intervention: increase memory or delete old sessions
+
+V1 capacity planning:
+- 4GB supports ~5000 sessions (assuming 800KB per session)
+- V1 target: 50 concurrent sessions (80x headroom)
+
+--------------------------------------------------
+
+9. Operations Runbook
+
+9.1 Manual Redis Restart Procedure
+
+1. Announce maintenance (email users)
+2. Stop Redis: `systemctl stop redis`
+3. Verify RDB snapshot exists: `/var/lib/redis/dump.rdb`
+4. Start Redis: `systemctl start redis`
+5. Verify load: `redis-cli INFO | grep rdb_last_save_time`
+6. Check key count: `redis-cli DBSIZE`
+
+Expected outcome:
+- Sessions from >5min ago restored
+- Recent sessions lost (users rejoin)
+- Media interruptions (users reconnect)
+
+Recovery time: ~30 seconds
+
+--------------------------------------------------
+
+9.2 Monitoring and Alerts
+
+Critical metrics:
+
+Redis connection failures:
+- Alert if: redis_connection_errors > 0 for 1 minute
+- Action: Check Redis logs, restart if needed
+
+Redis memory usage:
+- Alert if: used_memory > 3GB (75% of 4GB)
+- Action: Review session cleanup, consider upsize
+
+Permission refresh failures (from SFU):
+- Alert if: permission_fetch_failures > 10/minute
+- Action: Check Redis connectivity from SFU
+
+Stale sessions (not cleaned up):
+- Alert if: session count > 100 (should be <50)
+- Action: Manual cleanup script
+
+--------------------------------------------------
+
+10. Redis CLI Commands for Debugging
+
+List all sessions:
+  KEYS auth:sess:*:meta
+
+Get session details:
+  HGETALL auth:sess:sess_abc123:meta
+
+List participants in session:
+  HGETALL auth:sess:sess_abc123:participants
+
+Check if participant is present:
+  GET rt:presence:sess_abc:part_123
+  TTL rt:presence:sess_abc:part_123
+
+Count active connections:
+  KEYS rt:presence:* | wc -l
+
+Delete abandoned session (manual cleanup):
+  DEL auth:sess:sess_abc123:meta
+  DEL auth:sess:sess_abc123:participants
+
+--------------------------------------------------
+
+11. Schema Evolution Plan
+
+V1 Schema is frozen (changes require review).
+
+V2 Considerations:
+- Separate Redis instances for auth vs runtime?
+- Redis Cluster for sharding?
+- Lua scripts for atomic multi-key operations?
+
+Migration path:
+- Add version field to all authority keys
+- Write migration script before schema changes
+- Test on snapshot before production
+
+--------------------------------------------------
+
+End of DOC 10
