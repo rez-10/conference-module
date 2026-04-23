@@ -1,6 +1,6 @@
-# Minimal 1-to-1 WebRTC baseline
+# Minimal 1-to-1 WebRTC
 
-This folder contains a minimal signaling + browser client setup for 1-to-1 WebRTC:
+signaling + browser client setup for 1-to-1 WebRTC:
 
 - `server.js`: HTTP + WebSocket signaling server (`ws`) with room management.
 - `signaling.js`: WebSocket client helper.
@@ -70,5 +70,3 @@ const rtcConfig = {
   ],
 };
 ```
-
-Use short-lived TURN credentials in production.
