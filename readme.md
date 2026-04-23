@@ -1,11 +1,11 @@
-# Minimal 1-to-1 WebRTC
+# Peer-to-peer video conferencing
 
-signaling + browser client setup for 1-to-1 WebRTC:
+signaling + browser client setup for p2p WebRTC:
 
 - `server.js`: HTTP + WebSocket signaling server (`ws`) with room management.
 - `signaling.js`: WebSocket client helper.
 - `transport.js`: WebRTC transport logic in browser.
-- `index.html`: No-framework UI for joining a room and starting media.
+- `index.html`: UI for joining a room and starting media.
 
 ## Message format
 
@@ -23,14 +23,9 @@ Server relays `offer`, `answer`, and `ice-candidate` without inspecting SDP.
 
 ## Local run
 
-1. Install deps (includes `ws`):
-
 ```bash
 npm install
 ```
-
-2. Start signaling server:
-
 ```bash
 node webrtc-baseline/server.js
 ```
